@@ -1,0 +1,310 @@
+package com.bledroid.engine
+
+import android.bluetooth.BluetoothManager
+import android.bluetooth.le.AdvertiseCallback
+import android.bluetooth.le.AdvertiseData
+import android.bluetooth.le.AdvertiseSettings
+import android.bluetooth.le.BluetoothLeAdvertiser
+import android.bluetooth.le.BluetoothLeScanner
+import android.bluetooth.le.ScanCallback
+import android.bluetooth.le.ScanResult
+import android.bluetooth.le.ScanSettings
+import android.content.Context
+import android.os.ParcelUuid
+import android.util.Log
+import com.bledroid.models.AdvertisementSet
+import com.bledroid.models.SpamRadarEntry
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
+
+/**
+ * Classifies BLE advertisements by manufacturer ID and payload patterns
+ */
+object SpamClassifier {
+    private val FAST_PAIR_UUID = ParcelUuid.fromString("0000FE2C-0000-1000-8000-00805F9B34FB")
+
+    fun classify(result: ScanResult): String {
+        val record = result.scanRecord ?: return "Unknown"
+
+        // Check service UUIDs for Fast Pair
+        val serviceUuids = record.serviceUuids
+        if (serviceUuids != null) {
+            for (uuid in serviceUuids) {
+                if (uuid == FAST_PAIR_UUID) return "Fast Pair"
+            }
+        }
+
+        // Check service data for Fast Pair
+        val serviceData = record.serviceData
+        if (serviceData != null) {
+            for (entry in serviceData) {
+                if (entry.key == FAST_PAIR_UUID) return "Fast Pair"
+            }
+        }
+
+        // Check manufacturer data
+        val mfData = record.manufacturerSpecificData
+        if (mfData != null && mfData.size() > 0) {
+            for (i in 0 until mfData.size()) {
+                val mfId = mfData.keyAt(i)
+                val data = mfData.valueAt(i)
+
+                when (mfId) {
+                    76 -> { // Apple 0x004C
+                        if (data != null && data.isNotEmpty()) {
+                            return when (data[0].toInt() and 0xFF) {
+                                0x07 -> "Apple Action Modal"
+                                0x05, 0x07, 0x09, 0x10 -> "Apple Device Popup"
+                                else -> "Apple Continuity"
+                            }
+                        }
+                        return "Apple Continuity"
+                    }
+                    6 -> return "Swift Pair"       // Microsoft 0x0006
+                    117 -> {                        // Samsung 0x0075
+                        if (data != null && data.size >= 2) {
+                            return when (data[0].toInt() and 0xFF) {
+                                0x01 -> "Samsung Buds"
+                                0x02 -> "Samsung Watch"
+                                else -> "Samsung"
+                            }
+                        }
+                        return "Samsung"
+                    }
+                    255 -> return "Lovespouse"       // 0x00FF
+                }
+            }
+        }
+
+        return "Unknown BLE"
+    }
+
+    fun getManufacturerId(result: ScanResult): Int? {
+        val mfData = result.scanRecord?.manufacturerSpecificData ?: return null
+        if (mfData.size() > 0) return mfData.keyAt(0)
+        return null
+    }
+
+    fun getRawPayloadHex(result: ScanResult): String {
+        val bytes = result.scanRecord?.bytes ?: return ""
+        return bytes.joinToString("") { "%02X".format(it) }
+    }
+}
+
+class BleAdvertiserEngine(private val context: Context) {
+    private val tag = "BleAdvertiserEngine"
+
+    private val bluetoothManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
+    private val bluetoothAdapter get() = bluetoothManager.adapter
+    private val advertiser: BluetoothLeAdvertiser? get() = bluetoothAdapter?.bluetoothLeAdvertiser
+    private val scanner: BluetoothLeScanner? get() = bluetoothAdapter?.bluetoothLeScanner
+
+    private val _isRunning = MutableStateFlow(false)
+    val isRunning = _isRunning.asStateFlow()
+
+    private val _packetsSent = MutableStateFlow(0L)
+    val packetsSent = _packetsSent.asStateFlow()
+
+    private val _activeAdvertisers = MutableStateFlow(0)
+    val activeAdvertisers = _activeAdvertisers.asStateFlow()
+
+    // Spam Radar scan state
+    private val _isScanning = MutableStateFlow(false)
+    val isScanning = _isScanning.asStateFlow()
+
+    private val _scanResults = MutableStateFlow<List<SpamRadarEntry>>(emptyList())
+    val scanResults = _scanResults.asStateFlow()
+
+    private var spamJob: Job? = null
+    private val activeCallbacks = mutableListOf<AdvertiseCallback>()
+    private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+
+    private var scanCallback: ScanCallback? = null
+
+    var intervalMs: Long = 100L
+    var txPower: Int = AdvertiseSettings.ADVERTISE_TX_POWER_HIGH
+
+    fun isBluetoothEnabled(): Boolean = bluetoothAdapter?.isEnabled == true
+
+    fun start(advertisementSets: List<AdvertisementSet>) {
+        if (_isRunning.value) return
+        val adv = advertiser ?: run {
+            Log.e(tag, "BLE Advertiser not available")
+            return
+        }
+
+        _isRunning.value = true
+        _packetsSent.value = 0
+
+        val selectedSets = advertisementSets.filter { it.isSelected }
+        if (selectedSets.isEmpty()) {
+            _isRunning.value = false
+            return
+        }
+
+        spamJob = scope.launch {
+            while (isActive && _isRunning.value) {
+                for (adSet in selectedSets) {
+                    if (!isActive || !_isRunning.value) break
+                    try {
+                        startAdvertising(adv, adSet)
+                        _packetsSent.value++
+                        delay(intervalMs)
+                        stopAllAdvertising(adv)
+                    } catch (e: SecurityException) {
+                        Log.e(tag, "Permission denied: ${e.message}")
+                        _isRunning.value = false
+                        break
+                    } catch (e: Exception) {
+                        Log.e(tag, "Error: ${e.message}")
+                    }
+                }
+            }
+        }
+    }
+
+    fun stop() {
+        _isRunning.value = false
+        spamJob?.cancel()
+        spamJob = null
+        try {
+            advertiser?.let { stopAllAdvertising(it) }
+        } catch (_: SecurityException) { }
+        _activeAdvertisers.value = 0
+    }
+
+    // --- Spam Radar Scanner ---
+
+    fun startScan() {
+        if (_isScanning.value) return
+        val sc = scanner ?: run {
+            Log.e(tag, "BLE Scanner not available")
+            return
+        }
+
+        _isScanning.value = true
+        _scanResults.value = emptyList()
+
+        val settings = ScanSettings.Builder()
+            .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+            .setReportDelay(0)
+            .build()
+
+        scanCallback = object : ScanCallback() {
+            override fun onScanResult(callbackType: Int, result: ScanResult) {
+                val entry = SpamRadarEntry(
+                    deviceAddress = result.device?.address ?: "??:??:??:??:??:??",
+                    rssi = result.rssi,
+                    detectedType = SpamClassifier.classify(result),
+                    manufacturerId = SpamClassifier.getManufacturerId(result),
+                    rawPayloadHex = SpamClassifier.getRawPayloadHex(result),
+                    timestamp = System.currentTimeMillis()
+                )
+
+                val current = _scanResults.value.toMutableList()
+                // Update existing entry or add new (by address), keep max 100
+                val existingIdx = current.indexOfFirst { it.deviceAddress == entry.deviceAddress }
+                if (existingIdx >= 0) {
+                    current[existingIdx] = entry
+                } else {
+                    current.add(0, entry)
+                    if (current.size > 100) current.removeLast()
+                }
+                _scanResults.value = current
+            }
+
+            override fun onScanFailed(errorCode: Int) {
+                Log.e(tag, "Scan failed: $errorCode")
+                _isScanning.value = false
+            }
+        }
+
+        try {
+            sc.startScan(null, settings, scanCallback)
+        } catch (e: SecurityException) {
+            Log.e(tag, "Scan permission denied: ${e.message}")
+            _isScanning.value = false
+        }
+    }
+
+    fun stopScan() {
+        _isScanning.value = false
+        scanCallback?.let { cb ->
+            try {
+                scanner?.stopScan(cb)
+            } catch (_: SecurityException) { }
+        }
+        scanCallback = null
+    }
+
+    @Throws(SecurityException::class)
+    private fun startAdvertising(adv: BluetoothLeAdvertiser, adSet: AdvertisementSet) {
+        val settings = AdvertiseSettings.Builder()
+            .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY)
+            .setTxPowerLevel(txPower)
+            .setConnectable(adSet.connectable)
+            .setTimeout(0)
+            .build()
+
+        // Build advertise data WITHOUT chaining to avoid K2 type inference issues
+        val dataBuilder = AdvertiseData.Builder()
+        dataBuilder.setIncludeDeviceName(adSet.includeDeviceName)
+        dataBuilder.setIncludeTxPowerLevel(adSet.includeTxPower)
+        val mData = adSet.manufacturerData
+        if (mData != null) {
+            dataBuilder.addManufacturerData(mData.manufacturerId, mData.data)
+        }
+        val sData = adSet.serviceData
+        if (sData != null) {
+            dataBuilder.addServiceData(sData.serviceUuid, sData.data)
+        }
+        val advertiseData: AdvertiseData = dataBuilder.build()
+
+        // Build scan response the same way
+        var scanResponse: AdvertiseData? = null
+        val srData = adSet.scanResponseManufacturerData
+        if (srData != null) {
+            val srBuilder = AdvertiseData.Builder()
+            srBuilder.setIncludeDeviceName(false)
+            srBuilder.addManufacturerData(srData.manufacturerId, srData.data)
+            scanResponse = srBuilder.build()
+        }
+
+        val callback = object : AdvertiseCallback() {
+            override fun onStartSuccess(settingsInEffect: AdvertiseSettings?) {
+                _activeAdvertisers.value++
+            }
+            override fun onStartFailure(errorCode: Int) {
+                Log.w(tag, "Advertise failed: $errorCode")
+            }
+        }
+
+        synchronized(activeCallbacks) {
+            activeCallbacks.add(callback)
+        }
+
+        if (scanResponse != null) {
+            adv.startAdvertising(settings, advertiseData, scanResponse, callback)
+        } else {
+            adv.startAdvertising(settings, advertiseData, callback)
+        }
+    }
+
+    @Throws(SecurityException::class)
+    private fun stopAllAdvertising(adv: BluetoothLeAdvertiser) {
+        synchronized(activeCallbacks) {
+            activeCallbacks.forEach { cb ->
+                try { adv.stopAdvertising(cb) } catch (_: Exception) { }
+            }
+            activeCallbacks.clear()
+        }
+        _activeAdvertisers.value = 0
+    }
+
+    fun destroy() {
+        stop()
+        stopScan()
+        scope.cancel()
+    }
+}
